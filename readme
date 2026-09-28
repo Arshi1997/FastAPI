@@ -1,0 +1,202 @@
+##add DB migrations
+### AIb6 model [ check with MJ]
+
+# Middleware in FastAPI, using your own code
+
+## 1. The mental model
+
+**Middleware** is code that runs on every request before it reaches your route function, and on every response before it goes back to the client.
+
+Browser (React)
+     │  request
+     ▼
+┌─────────────────────────────┐
+│ Middleware A (e.g. CORS)    │
+│  ┌───────────────────────┐  │
+│  │ Middleware B (logging)│  │
+│  │  ┌─────────────────┐  │  │
+│  │  │ Your route      │  │  │
+│  │  │ read_users()    │  │  │
+│  │  └─────────────────┘  │  │
+│  └───────────────────────┘  │
+└─────────────────────────────┘
+     │  response
+     ▼
+Browser
+
+Think of it as an onion. The request travels inward through the layers, and the response travels back outward through the same layers in reverse.
+
+Typical jobs for middleware are CORS, authentication, logging, rate limiting, timing, and adding headers. These are cross-cutting concerns, meaning things you want on all routes without copy-pasting into each one.
+
+## 2. You already use middleware
+
+<!-- python -->
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+| Keyword          | Meaning |
+|------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| `app`            | Your FastAPI application object. |
+| `add_middleware(...)` | Registers a middleware class on the app. Every request will now pass through it. |
+| `CORSMiddleware` | Built-in middleware that adds the `Access-Control-*` headers browsers require. |
+| **CORS**         | Cross-Origin Resource Sharing. A browser rule: JS loaded from one origin (`localhost:5173`) can't call another origin    (`localhost:8000`) unless the server explicitly allows it. |
+| **Origin**       | scheme + host + port. `localhost:5173` and `localhost:8000` are different origins because the ports differ. |
+| `allow_origins`  | Which origins may call your API. You listed your Vite dev server. `["*"]` means anyone. |
+| `allow_credentials` | Allows cookies and auth headers to be sent. Note that `True` combined with `allow_origins=["*"]` is not allowed, so your explicit origin is correct. |
+| `allow_methods`  | Which HTTP verbs are allowed (GET, POST, PUT, DELETE...). `"*"` means all. |
+| `allow_headers`  | Which request headers the browser may send (`Authorization`, `Content-Type`...). |
+
+Before a POST/PUT/DELETE with JSON, the browser sends a **preflight**, an `OPTIONS` request that asks "am I allowed to do this?"
+`CORSMiddleware` answers it automatically, and your route functions never see it. That's middleware doing its job.
+
+## 3. Writing your own middleware
+
+python
+import time, uuid
+from fastapi import Request
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = str(uuid.uuid4())[:8]
+    start = time.perf_counter()
+
+    response = await call_next(request)          # <- runs the rest of the app
+
+    ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time-ms"] = f"{ms:.1f}"
+    print(f"[{request_id}] {request.method} {request.url.path} -> {response.status_code} ({ms:.1f} ms)")
+    return response
+
+
+| Keyword                  | Meaning |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------|
+| `@app.middleware("http")`| Decorator that registers a function as middleware for HTTP requests. |
+| `async def`              | An asynchronous function. It can pause at `await` so the server handles other requests meanwhile. |
+| `request: Request`       | Object holding everything about the incoming call: `.method`, `.url.path`, `.headers`, `.client.host`, `.query_params`. |
+| `call_next`              | A function that passes the request to the next layer (eventually your route). It returns the response. |
+| `await call_next(request)` | The dividing line. Code above it runs before the route, and code below it runs after. |
+| `response.headers[...]`  | You can modify the outgoing response, for example to add headers. |
+| `return response`        | You must return a response, or the client gets nothing. |
+
+Hit `/api/users` now, and you'll see the two new headers in your browser's Network tab.
+
+## 4. Auth middleware, which can short-circuit
+
+Middleware doesn't have to call `call_next`. It can reject the request and return its own response, and your route never runs.
+
+python
+from fastapi.responses import JSONResponse
+
+API_KEY = os.getenv("API_KEY", "dev-secret")
+PUBLIC_PATHS = {"/", "/docs", "/openapi.json"}
+
+@app.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
+        return await call_next(request)          # let preflight + public pages through
+
+    if request.headers.get("x-api-key") != API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+
+    return await call_next(request)
+
+
+Two details to note:
+
+- `JSONResponse` is returned directly, not raised as `HTTPException`. Exceptions raised inside middleware aren't converted into responses by FastAPI's handlers, so you build the response yourself.
+- `OPTIONS` is let through because CORS preflights don't carry your API key. If you block them, the browser reports a confusing "CORS error".
+
+## 5. The AI/LLM connection: rate limiting
+
+When you build a RAG chatbot endpoint like `/api/chat`, each call costs money (LLM tokens) and time (vector search plus generation). Rate limiting protects you.
+
+python
+from collections import defaultdict, deque
+
+hits = defaultdict(deque)     # ip -> timestamps of recent calls
+LIMIT, WINDOW = 5, 60         # 5 requests per 60 seconds
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if not request.url.path.startswith("/api/chat"):
+        return await call_next(request)
+
+    ip = request.client.host
+    now = time.time()
+    q = hits[ip]
+
+    while q and now - q[0] > WINDOW:   # drop timestamps outside the window
+        q.popleft()
+
+    if len(q) >= LIMIT:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests"},
+            headers={"Retry-After": str(WINDOW)},
+        )
+
+    q.append(now)
+    return await call_next(request)
+
+
+| Keyword | Meaning |
+|---|---|
+| `defaultdict(deque)` | A dict that auto-creates an empty deque for missing keys. A `deque` is a list that's fast to pop from the front. |
+| `request.client.host` | The caller's IP address. |
+| `429` | HTTP "Too Many Requests". |
+| `Retry-After` | Standard header telling the client when to retry. |
+
+This is in-memory, so it only works for a single process. With multiple replicas or workers you'd move the counters to Redis.
+
+In real LLM/RAG apps, middleware is the right place for auth, rate limits, request IDs and tracing (LangSmith, OpenTelemetry), and logging latency. The RAG logic itself (embedding the query, retrieving chunks, calling the LLM) belongs in route functions or services, not middleware.
+
+## 6. Order matters
+
+python
+app.add_middleware(A)
+app.add_middleware(B)
+app.add_middleware(C)
+
+
+The last one added is the outermost, so requests flow **C → B → A → route**, and responses flow back A → B → C. Decorator-style `@app.middleware("http")` follows the same rule.
+
+This is why CORS should usually be added last, so it's outermost. Then even a 401 or 429 from an inner middleware still gets CORS headers, and the browser shows the real error instead of a fake CORS one.
+
+## 7. Middleware vs `Depends`
+
+You already use `Depends(get_db)`, and the two are different tools:
+
+| | Middleware | `Depends` |
+|---|---|---|
+| Scope | Every request, globally | Only routes that declare it |
+| Knows about route params/body | No (sees raw request) | Yes (typed, validated) |
+| Good for | CORS, logging, rate limits, headers | DB sessions, current user, per-route auth |
+| Can return a value to the route | No | Yes (`db`, `user`, ...) |
+
+Rule of thumb: if the route needs the result (a DB session, the logged-in user), use `Depends`. If it's a blanket policy on all traffic, use middleware.
+
+## 8. A caveat for streaming
+
+`@app.middleware("http")` is built on `BaseHTTPMiddleware`, which can interfere with streaming responses (SSE/token-by-token LLM output) and with background tasks. For a streaming chat endpoint, the fix is to write pure ASGI middleware. Don't worry about that yet, but remember it when you add streaming.
+
+## 9. Honest notes on your current code
+
+- **Duplicate route:** `@app.get("/api/users")` is defined twice. Only the first one is used, so delete the second.
+- **Redundant `db.close()`:** your `get_db()` already closes the session in `finally`. Closing inside routes is unnecessary, and you'd be closing twice.
+- **404 returned as 200:** `return {"message": "User not found"}` sends HTTP 200. Use `raise HTTPException(status_code=404, detail="User not found")` (`from fastapi import HTTPException`) so React can detect the error properly.
+
+## 10. Exercise
+
+1. Add the `log_requests` middleware and watch your terminal as React calls the API.
+2. Add `api_key_guard`, then call `/api/users` with and without an `x-api-key` header.
+3. Move `add_middleware(CORSMiddleware, ...)` to the bottom and see how the order changes behavior.
+4. Add a fake `/api/chat` route and test the rate limiter by hitting it 6 times.
+
+If you'd like, I can next show streaming LLM responses in FastAPI, or pure ASGI middleware for that case.
