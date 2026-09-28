@@ -7,22 +7,22 @@
 
 **Middleware** is code that runs on every request before it reaches your route function, and on every response before it goes back to the client.
 
-Browser (React)
-     │  request
-     ▼
-┌─────────────────────────────┐
-│ Middleware A (e.g. CORS)    │
-│  ┌───────────────────────┐  │
-│  │ Middleware B (logging)│  │
-│  │  ┌─────────────────┐  │  │
-│  │  │ Your route      │  │  │
-│  │  │ read_users()    │  │  │
-│  │  └─────────────────┘  │  │
-│  └───────────────────────┘  │
-└─────────────────────────────┘
-     │  response
-     ▼
-Browser
+                                                                  Browser (React)
+                                                                      │  request
+                                                                      ▼
+                                                                 ┌─────────────────────────────┐
+                                                                 │ Middleware A (e.g. CORS)    │
+                                                                 │  ┌───────────────────────┐  │
+                                                                 │  │ Middleware B (logging)│  │
+                                                                 │  │  ┌─────────────────┐  │  │
+                                                                 │  │  │ Your route      │  │  │
+                                                                 │  │  │ read_users()    │  │  │
+                                                                 │  │  └─────────────────┘  │  │
+                                                                 │  └───────────────────────┘  │
+                                                                 └─────────────────────────────┘
+                                                                      │  response
+                                                                      ▼
+                                                                   Browser
 
 Think of it as an onion. The request travels inward through the layers, and the response travels back outward through the same layers in reverse.
 
