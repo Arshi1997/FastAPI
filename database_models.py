@@ -11,6 +11,4 @@ class User(Base):
     age = Column(Integer)
     std = Column(String)
     gender = Column(String)
-    email = Column(String)
-
-    
+    email = Column(String, nullable=True)

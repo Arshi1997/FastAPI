@@ -6,3 +6,4 @@ class user(BaseModel):
     age: int
     std: str
     gender: str
+    email: str | None = None  # email is optional

@@ -6,6 +6,7 @@ export interface User {
   age: number;
   std: string;
   gender: string;
+  email?: string; // email is optional
 }
 
 export async function getUsers(): Promise<User[]> {

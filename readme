@@ -1,202 +1,499 @@
-##add DB migrations
-### AIb6 model [ check with MJ]
+# LLM / AI Agent Learning POC
 
-# Middleware in FastAPI, using your own code
+A hands-on learning project: a FastAPI backend that serves an AI agent which answers questions about data in Postgres. The agent never touches the database. It calls tools exposed by a separate **MCP server**, and the reasoning is done by a **local LLM** running on Ollama.
 
-## 1. The mental model
+The same agent is built twice on purpose:
 
-**Middleware** is code that runs on every request before it reaches your route function, and on every response before it goes back to the client.
+1. **By hand** (`agent_loop.py`), so every step of the agent loop is visible.
+2. **With Agno + AgentOS** (`agents.py`), to see what a framework does for you.
 
-                                                                  Browser (React)
-                                                                      │  request
-                                                                      ▼
-                                                                 ┌─────────────────────────────┐
-                                                                 │ Middleware A (e.g. CORS)    │
-                                                                 │  ┌───────────────────────┐  │
-                                                                 │  │ Middleware B (logging)│  │
-                                                                 │  │  ┌─────────────────┐  │  │
-                                                                 │  │  │ Your route      │  │  │
-                                                                 │  │  │ read_users()    │  │  │
-                                                                 │  │  └─────────────────┘  │  │
-                                                                 │  └───────────────────────┘  │
-                                                                 └─────────────────────────────┘
-                                                                      │  response
-                                                                      ▼
-                                                                   Browser
+> **Scope:** this is a local learning project on dummy data. No authentication, no tests, no evaluation, not production-ready.
 
-Think of it as an onion. The request travels inward through the layers, and the response travels back outward through the same layers in reverse.
+---
 
-Typical jobs for middleware are CORS, authentication, logging, rate limiting, timing, and adding headers. These are cross-cutting concerns, meaning things you want on all routes without copy-pasting into each one.
+## 1. What was built
 
-## 2. You already use middleware
+| Piece | File / service | Port | Role |
+|---|---|---|---|
+| FastAPI app | `main.py` | 8000 | Original CRUD routes (`/api/users`, ...) plus `/api/chat/agent` |
+| AgentOS | wraps the app in `main.py` | 8000 | Adds the agent API (`/agents`, `/sessions`, `/traces`, ...) |
+| Hand-written agent | `agent_loop.py` | (in app) | The agent loop written without a framework |
+| Agno agents | `agents.py` | (in app) | `ops-agent` (users DB tools) and `docs-agent` (Microsoft docs) |
+| MCP server | `mcp_server.py` | 9000 | Read-only tools over the users table |
+| Microsoft Learn MCP | `https://learn.microsoft.com/api/mcp` | remote | Public docs search server used by `docs-agent` |
+| LLM | Ollama (`llama3.1:8b`) | 11434 | The model |
+| App database | Postgres + SQLAlchemy + Alembic | 5432 | Users table |
+| Agent session store | `agno.db` (SQLite) | file | Agno sessions and traces |
+| Frontend | `frontend/` (Vite + React + TS) | 5173 | Not yet wired to the agent |
 
-<!-- python -->
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+---
+
+## 2. Architecture
+
+```
+                         LLM (Ollama, :11434)
+                                ^
+                                |
+ UI / PowerShell  --->  AGNO AGENT  --- MCP client --->  MCP server (:9000) ---> Postgres
+ (os.agno.com)          (inside the                      get_users
+                         FastAPI app, :8000)             get_user_by_id
+                                |
+                                +--- MCP client --->  Microsoft Learn MCP (remote)
+                                |                      microsoft_docs_search, ...
+                                +--- agno.db (sessions, traces)
+```
+
+The agent is the coordinator in the middle. The LLM never talks to the MCP server, the MCP server never talks to the LLM, and neither talks to the user. Every message goes through the agent.
+
+### Request flow (Agno path)
+
+1. The user asks a question (AgentOS UI or `POST /agents/{id}/runs`).
+2. AgentOS hands it to the agent.
+3. The agent sends the question, history and tool list to the LLM.
+4. The LLM replies with a tool request: function name and arguments (for example `get_users` with `std='10th'`). This is only text. The model runs nothing.
+5. The agent passes the request to its **MCP client** (`MCPTools`).
+6. The MCP client sends `tools/call` to the MCP server over HTTP.
+7. The MCP server runs the function, queries Postgres, and returns the rows.
+8. The agent sends the rows back to the LLM.
+9. The LLM writes the final answer, which returns through AgentOS to the user.
+
+Steps 3 to 9 are the **agent loop**. If the model needs no tool, it answers immediately and the tool steps are skipped.
+
+### Request flow (hand-written path)
+
+```
+POST /api/chat/agent -> agent_loop.py -> Ollama
+                              |
+                              +-> get_users() called directly -> Postgres
+```
+
+Same loop, but the tool is a plain Python function in the same file. No MCP, no Agno.
+
+---
+
+## 3. Core concepts
+
+**LLM = stateless text-to-text API.** It has no memory. A "conversation" is the whole transcript resent on every call. It can only output text, so it cannot query a database by itself.
+
+**Agent = a loop around the LLM.** The model proposes a tool call, your code executes it, the result is appended to the messages, and the loop repeats until the model answers without asking for a tool. The loop in `agent_loop.py`:
+
+```
+repeat up to 5 times:
+    ask the model
+    if it asked for a tool -> run it, append the result, go around again
+    else -> return its answer
+```
+
+The iteration cap is a safety net against runaway loops (like max retries on a controller).
+
+**Tool calling is "plan, then apply".** The model outputs a plan (a structured tool request). Your code is the executor. The agent can do exactly what its tools can do, so least privilege applies.
+
+**MCP (Model Context Protocol)** is a standard contract between agents and tool servers, similar in spirit to OpenAPI for tools.
+- *MCP server*: exposes tools (`mcp_server.py`, Microsoft's server).
+- *MCP client*: lives inside the agent (`MCPTools`). At startup it connects, lists tools, and registers them with the agent. On each tool call it forwards the request to the server. It decides nothing.
+- The tool's name, docstring and type hints become the schema the model reads. A vague docstring means the model uses the tool badly.
+
+**Agno** is the agent framework. It replaces the hand-written loop and adds sessions, tool discovery and tracing. **AgentOS** is the runtime that serves agents as a FastAPI API (runs, sessions, traces, health).
+
+**Temperature** divides the model's token scores before softmax, then the next token is sampled. Low temperature sharpens the distribution (the top token almost always wins), high temperature flattens it. Tool arguments and arithmetic need low temperature (about 0 to 0.3). See section 9.
+
+---
+
+## 4. Project layout
+
+```
+fastAPI/
+├── main.py                 FastAPI routes + AgentOS wrapping
+├── agent_loop.py           hand-written agent loop (Ollama via OpenAI-style client)
+├── agents.py               Agno agents: ops_agent, docs_agent
+├── mcp_server.py           MCP tool server (users table), port 9000
+├── database.py             SQLAlchemy engine + SessionLocal
+├── database_models.py      ORM models (User)
+├── users.py                Pydantic model for user
+├── alembic.ini
+├── migration/              Alembic env + versions/
+├── agno.db                 Agno session store (generated; do not commit)
+├── .env                    backend secrets (do not commit)
+├── venv/                   virtual environment (do not commit)
+└── frontend/               Vite + React + TypeScript app
+```
+
+---
+
+## 5. Setup (Windows / PowerShell)
+
+### Prerequisites
+- Python 3.13, Node.js, Postgres running on `localhost:5432`
+- [Ollama](https://ollama.com) installed and running
+
+### Python environment
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1        # prompt must show (venv)
+pip install -U "fastapi[standard]" "agno[os]" mcp openai ollama python-dotenv sqlalchemy psycopg2-binary alembic
+```
+
+If PowerShell blocks the activation script: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+### Database migrations
+
+```powershell
+alembic current
+alembic upgrade head
+```
+
+Notes:
+- The `user` table is created by `create_all()` in `main.py`, not by Alembic.
+- The migration history contains one migration that adds the nullable `email` column to `user`.
+- New columns on existing tables need an Alembic migration. `create_all()` never alters existing tables.
+- If `alembic upgrade head` fails with `DuplicateColumn`, a duplicate "add email" migration exists. Keep only one.
+
+### Local model
+
+```powershell
+ollama pull llama3.1:8b
+ollama ps          # shows loaded models and CPU/GPU split
+```
+
+### Environment file
+
+No API key is needed for the local-model setup. If you later use a hosted provider, put its key in the **backend** `.env` in the project root, never in `frontend/.env` (anything with a `VITE_` prefix is bundled into the browser).
+
+---
+
+## 6. Running
+
+Use two terminals, both with the venv active, both started from the project root.
+
+```powershell
+# Terminal 1: start FIRST
+python .\mcp_server.py
+# wait for: Uvicorn running on http://127.0.0.1:9000
+
+# Terminal 2
+python -m uvicorn main:app --port 8000
+```
+
+The app connects to the MCP servers at startup, so the MCP server must already be running.
+
+Healthy startup log:
+
+```
+Function: get_users registered with mcp_localhost_9000_mcp
+Function: get_user_by_id registered with mcp_localhost_9000_mcp
+Application startup complete.
+```
+
+Prefer `python -m uvicorn` over `fastapi dev` while the project lives in OneDrive (see troubleshooting).
+
+### Try it
+
+**Hand-written agent:**
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/chat/agent -ContentType "application/json" -Body '{"message":"How many users are in 10th, and what is their average age?"}'
+```
+
+Expected answer from the seed data: 3 users (Alice 25, David 28, Grace 26), average age about 26.3. The server log prints `tool call: get_users {'std': '10th'}`.
+
+**Agno agents:** open `https://os.agno.com`, choose **Local**, connect to `http://localhost:8000`, pick **Ops Agent** (users data) or **Microsoft Docs Agent** (Azure and Microsoft questions), and ask a question. API explorer: `http://localhost:8000/docs`.
+
+**Test an MCP server by itself:**
+
+```powershell
+npx @modelcontextprotocol/inspector
+```
+
+Choose **Streamable HTTP**, URL `http://127.0.0.1:9000/mcp` (or `https://learn.microsoft.com/api/mcp`), connect, open the Tools tab.
+
+---
+
+## 7. Key code
+
+### `main.py` (additions at the bottom, after all routes)
+
+```python
+from agno.os import AgentOS
+from agents import ops_agent, docs_agent
+
+agent_os = AgentOS(
+    agents=[ops_agent, docs_agent],
+    base_app=app,
+    on_route_conflict="preserve_base_app",   # keep our own GET /
+    tracing=True,
+)
+app = agent_os.get_app()
+```
+
+### `agents.py`
+
+```python
+from agno.agent import Agent
+from agno.db.sqlite import SqliteDb
+from agno.models.ollama import Ollama
+from agno.tools.mcp import MCPTools
+
+db = SqliteDb(db_file="agno.db")      # one shared store for both agents
+
+ops_agent = Agent(
+    id="ops-agent",
+    name="Ops Agent",
+    model=Ollama(id="llama3.1:8b"),
+    db=db,
+    tools=[MCPTools(transport="streamable-http", url="http://localhost:9000/mcp")],
+    add_history_to_context=True,
+    debug_mode=True,
 )
 
+docs_agent = Agent(
+    id="docs-agent",
+    name="Microsoft Docs Agent",
+    model=Ollama(id="llama3.1:8b"),
+    db=db,
+    tools=[MCPTools(transport="streamable-http", url="https://learn.microsoft.com/api/mcp")],
+    instructions=["Answer Microsoft and Azure questions by searching the docs tools first, and list the page URLs you used."],
+    add_history_to_context=True,
+)
+```
 
-| Keyword          | Meaning |
-|------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| `app`            | Your FastAPI application object. |
-| `add_middleware(...)` | Registers a middleware class on the app. Every request will now pass through it. |
-| `CORSMiddleware` | Built-in middleware that adds the `Access-Control-*` headers browsers require. |
-| **CORS**         | Cross-Origin Resource Sharing. A browser rule: JS loaded from one origin (`localhost:5173`) can't call another origin    (`localhost:8000`) unless the server explicitly allows it. |
-| **Origin**       | scheme + host + port. `localhost:5173` and `localhost:8000` are different origins because the ports differ. |
-| `allow_origins`  | Which origins may call your API. You listed your Vite dev server. `["*"]` means anyone. |
-| `allow_credentials` | Allows cookies and auth headers to be sent. Note that `True` combined with `allow_origins=["*"]` is not allowed, so your explicit origin is correct. |
-| `allow_methods`  | Which HTTP verbs are allowed (GET, POST, PUT, DELETE...). `"*"` means all. |
-| `allow_headers`  | Which request headers the browser may send (`Authorization`, `Content-Type`...). |
+### `mcp_server.py`
 
-Before a POST/PUT/DELETE with JSON, the browser sends a **preflight**, an `OPTIONS` request that asks "am I allowed to do this?"
-`CORSMiddleware` answers it automatically, and your route functions never see it. That's middleware doing its job.
+```python
+from mcp.server.fastmcp import FastMCP
+from database import SessionLocal
+import database_models
 
-## 3. Writing your own middleware
+mcp = FastMCP("users-tools", port=9000)
 
-python
-import time, uuid
-from fastapi import Request
+def _row(u) -> dict:
+    return {"id": u.id, "name": u.name, "age": u.age, "std": u.std,
+            "gender": u.gender, "email": u.email}
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    request_id = str(uuid.uuid4())[:8]
-    start = time.perf_counter()
+@mcp.tool()
+def get_users(std: str | None = None) -> list[dict]:
+    """List users from the database, optionally filtered by class, e.g. '10th'."""
+    db = SessionLocal()
+    try:
+        q = db.query(database_models.User)
+        if std:
+            q = q.filter(database_models.User.std == std)
+        return [_row(u) for u in q.all()]
+    finally:
+        db.close()
 
-    response = await call_next(request)          # <- runs the rest of the app
+@mcp.tool()
+def get_user_by_id(user_id: int) -> dict:
+    """Get a single user by id. Returns an error message if not found."""
+    db = SessionLocal()
+    try:
+        u = db.query(database_models.User).filter(database_models.User.id == user_id).first()
+        return _row(u) if u else {"error": f"No user with id {user_id}"}
+    finally:
+        db.close()
 
-    ms = (time.perf_counter() - start) * 1000
-    response.headers["X-Request-ID"] = request_id
-    response.headers["X-Process-Time-ms"] = f"{ms:.1f}"
-    print(f"[{request_id}] {request.method} {request.url.path} -> {response.status_code} ({ms:.1f} ms)")
-    return response
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")   # http://localhost:9000/mcp
+```
 
+### `agent_loop.py`
 
-| Keyword                  | Meaning |
-|--------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `@app.middleware("http")`| Decorator that registers a function as middleware for HTTP requests. |
-| `async def`              | An asynchronous function. It can pause at `await` so the server handles other requests meanwhile. |
-| `request: Request`       | Object holding everything about the incoming call: `.method`, `.url.path`, `.headers`, `.client.host`, `.query_params`. |
-| `call_next`              | A function that passes the request to the next layer (eventually your route). It returns the response. |
-| `await call_next(request)` | The dividing line. Code above it runs before the route, and code below it runs after. |
-| `response.headers[...]`  | You can modify the outgoing response, for example to add headers. |
-| `return response`        | You must return a response, or the client gets nothing. |
+```python
+import json
+from openai import OpenAI              # client library only; talks to Ollama, not to OpenAI
+from database import SessionLocal
+import database_models
 
-Hit `/api/users` now, and you'll see the two new headers in your browser's Network tab.
+client = OpenAI(api_key="ollama", base_url="http://localhost:11434/v1")   # key ignored but required
+MODEL = "llama3.1:8b"
 
-## 4. Auth middleware, which can short-circuit
+def get_users(std: str | None = None) -> list[dict]:
+    db = SessionLocal()
+    try:
+        q = db.query(database_models.User)
+        if std:
+            q = q.filter(database_models.User.std == std)
+        return [{"id": u.id, "name": u.name, "age": u.age,
+                 "std": u.std, "gender": u.gender} for u in q.all()]
+    finally:
+        db.close()
 
-Middleware doesn't have to call `call_next`. It can reject the request and return its own response, and your route never runs.
+TOOLS = {"get_users": get_users}
+TOOL_SPECS = [{
+    "type": "function",
+    "function": {
+        "name": "get_users",
+        "description": "List users from the database, optionally filtered by class, e.g. '10th'.",
+        "parameters": {"type": "object", "properties": {"std": {"type": "string"}}},
+    },
+}]
 
-python
-from fastapi.responses import JSONResponse
+def run_agent(question: str, temperature: float = 0.2) -> str:
+    messages = [{"role": "user", "content": question}]
+    for _ in range(5):                       # loop cap
+        r = client.chat.completions.create(model=MODEL, messages=messages,
+                                           tools=TOOL_SPECS, temperature=temperature)
+        msg = r.choices[0].message
+        messages.append(msg.model_dump(exclude_none=True))
+        if not msg.tool_calls:               # no tool requested: model is done
+            return msg.content
+        for call in msg.tool_calls:
+            args = json.loads(call.function.arguments or "{}")
+            print("tool call:", call.function.name, args)
+            out = TOOLS[call.function.name](**args)
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": json.dumps(out)})
+    return "Stopped: too many tool calls"
+```
 
-API_KEY = os.getenv("API_KEY", "dev-secret")
-PUBLIC_PATHS = {"/", "/docs", "/openapi.json"}
+The route in `main.py`:
 
-@app.middleware("http")
-async def api_key_guard(request: Request, call_next):
-    if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
-        return await call_next(request)          # let preflight + public pages through
+```python
+class ChatRequest(BaseModel):
+    message: str
 
-    if request.headers.get("x-api-key") != API_KEY:
-        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+@app.post("/api/chat/agent")
+def chat_agent(req: ChatRequest):
+    return {"reply": run_agent(req.message)}
+```
 
-    return await call_next(request)
+---
 
+## 8. Endpoints
 
-Two details to note:
+**Own routes:** `GET /`, `GET/POST /api/users`, `GET/PUT/DELETE /api/users/{id}`, `GET /api/stats`, `POST /api/chat/agent`.
 
-- `JSONResponse` is returned directly, not raised as `HTTPException`. Exceptions raised inside middleware aren't converted into responses by FastAPI's handlers, so you build the response yourself.
-- `OPTIONS` is let through because CORS preflights don't carry your API key. If you block them, the browser reports a confusing "CORS error".
+**Added by AgentOS** (you did not write these):
 
-## 5. The AI/LLM connection: rate limiting
-
-When you build a RAG chatbot endpoint like `/api/chat`, each call costs money (LLM tokens) and time (vector search plus generation). Rate limiting protects you.
-
-python
-from collections import defaultdict, deque
-
-hits = defaultdict(deque)     # ip -> timestamps of recent calls
-LIMIT, WINDOW = 5, 60         # 5 requests per 60 seconds
-
-@app.middleware("http")
-async def rate_limit(request: Request, call_next):
-    if not request.url.path.startswith("/api/chat"):
-        return await call_next(request)
-
-    ip = request.client.host
-    now = time.time()
-    q = hits[ip]
-
-    while q and now - q[0] > WINDOW:   # drop timestamps outside the window
-        q.popleft()
-
-    if len(q) >= LIMIT:
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Too many requests"},
-            headers={"Retry-After": str(WINDOW)},
-        )
-
-    q.append(now)
-    return await call_next(request)
-
-
-| Keyword | Meaning |
-|---|---|
-| `defaultdict(deque)` | A dict that auto-creates an empty deque for missing keys. A `deque` is a list that's fast to pop from the front. |
-| `request.client.host` | The caller's IP address. |
-| `429` | HTTP "Too Many Requests". |
-| `Retry-After` | Standard header telling the client when to retry. |
-
-This is in-memory, so it only works for a single process. With multiple replicas or workers you'd move the counters to Redis.
-
-In real LLM/RAG apps, middleware is the right place for auth, rate limits, request IDs and tracing (LangSmith, OpenTelemetry), and logging latency. The RAG logic itself (embedding the query, retrieving chunks, calling the LLM) belongs in route functions or services, not middleware.
-
-## 6. Order matters
-
-python
-app.add_middleware(A)
-app.add_middleware(B)
-app.add_middleware(C)
-
-
-The last one added is the outermost, so requests flow **C → B → A → route**, and responses flow back A → B → C. Decorator-style `@app.middleware("http")` follows the same rule.
-
-This is why CORS should usually be added last, so it's outermost. Then even a 401 or 429 from an inner middleware still gets CORS headers, and the browser shows the real error instead of a fake CORS one.
-
-## 7. Middleware vs `Depends`
-
-You already use `Depends(get_db)`, and the two are different tools:
-
-| | Middleware | `Depends` |
+| Group | Examples | Use |
 |---|---|---|
-| Scope | Every request, globally | Only routes that declare it |
-| Knows about route params/body | No (sees raw request) | Yes (typed, validated) |
-| Good for | CORS, logging, rate limits, headers | DB sessions, current user, per-route auth |
-| Can return a value to the route | No | Yes (`db`, `user`, ...) |
+| Agents | `GET /agents`, `POST /agents/{agent_id}/runs` | List agents, run one. The runs endpoint is what a React frontend would call |
+| Sessions | `/sessions...` | Stored conversations |
+| Traces | `/traces...` | Recorded steps of each run: model calls, tool calls, timing |
+| Metrics, Health, Core | `/metrics`, `/health`, `/info`, `/config` | Usage, liveness, loaded config |
+| Memory, Knowledge, Evals, Learnings | `/memories`, `/knowledge/...`, `/eval-runs` | Optional Agno features, unused so far |
+| Teams, Workflows | `/teams`, `/workflows` | Multi-agent and pipelines, none defined |
+| Queue, Components, Schedules, Approvals, Service Accounts | marked Disabled | Need a database passed to `AgentOS` itself |
 
-Rule of thumb: if the route needs the result (a DB session, the logged-in user), use `Depends`. If it's a blanket policy on all traffic, use middleware.
+A `WebSocket /workflows/ws` connection in the log is the AgentOS UI opening a live-progress channel. It is harmless. WebSocket routes do not appear on `/docs`.
 
-## 8. A caveat for streaming
+---
 
-`@app.middleware("http")` is built on `BaseHTTPMiddleware`, which can interfere with streaming responses (SSE/token-by-token LLM output) and with background tasks. For a streaming chat endpoint, the fix is to write pure ASGI middleware. Don't worry about that yet, but remember it when you add streaming.
+## 9. Phase 2: LM Studio, temperature, and next builds
 
-## 9. Honest notes on your current code
+### Switch the runner to LM Studio (free)
 
-- **Duplicate route:** `@app.get("/api/users")` is defined twice. Only the first one is used, so delete the second.
-- **Redundant `db.close()`:** your `get_db()` already closes the session in `finally`. Closing inside routes is unnecessary, and you'd be closing twice.
-- **404 returned as 200:** `return {"message": "User not found"}` sends HTTP 200. Use `raise HTTPException(status_code=404, detail="User not found")` (`from fastapi import HTTPException`) so React can detect the error properly.
+Download a 7 to 8B instruct model with tool-use support (4-bit quantization fits 16 GB), start the local server in LM Studio (listens on `http://localhost:1234/v1`), then change two lines in `agent_loop.py`:
 
-## 10. Exercise
+```python
+client = OpenAI(api_key="lm-studio", base_url="http://localhost:1234/v1")
+MODEL = "<model identifier shown in LM Studio>"
+```
 
-1. Add the `log_requests` middleware and watch your terminal as React calls the API.
-2. Add `api_key_guard`, then call `/api/users` with and without an `x-api-key` header.
-3. Move `add_middleware(CORSMiddleware, ...)` to the bottom and see how the order changes behavior.
-4. Add a fake `/api/chat` route and test the rate limiter by hitting it 6 times.
+### Temperature experiments
 
-If you'd like, I can next show streaming LLM responses in FastAPI, or pure ASGI middleware for that case.
+Background: the model outputs a score per token, softmax turns scores into probabilities, and temperature rescales the scores first.
+
+```python
+import math
+logits = {"Paris": 5.0, "Lyon": 3.0, "London": 2.0}
+def softmax(scores, T):
+    exps = {k: math.exp(v / T) for k, v in scores.items()}
+    total = sum(exps.values())
+    return {k: round(e / total, 3) for k, e in exps.items()}
+for T in (0.5, 1.0, 2.0):
+    print(T, softmax(logits, T))
+```
+
+Experiment A: same prompt at temperatures 0.0, 0.7, 1.5, three runs each, compare variation.
+Experiment B: run the users question 5 times at 0.0 and 5 times at 1.2 through `run_agent(..., temperature=T)`. Count correct tool calls and correct answers (3 users, about 26.3).
+
+| Task | Temperature |
+|---|---|
+| Tool calling, extraction, code | 0 to 0.3 |
+| General chat | 0.5 to 0.8 |
+| Brainstorming, creative | 0.8 to 1.2 |
+
+### Next builds (ideas)
+
+1. **Pipeline triage agent**: read-only MCP server over the Azure DevOps REST API with tools to list failed runs, get failed steps, and return the tail of a log. Use a personal access token with only **Build: Read**, short expiry, kept in `.env`. Truncate logs on purpose to protect the context window. Confirm company policy before pointing a tool at company systems.
+2. Read-only AWS ECS/CloudWatch tools via `boto3`.
+3. Read-only Kubernetes tools (get, describe, events).
+4. Runbook search (retrieval over your own documents).
+5. Write an MCP client by hand with the `mcp` Python library (connect, list tools, call one) to see what `MCPTools` does.
+6. Wire the React frontend to `POST /agents/{agent_id}/runs` with `stream=true`.
+
+---
+
+## 10. DevOps view
+
+| AI concept | DevOps analogy |
+|---|---|
+| LLM | Stateless backend service you call, non-deterministic output |
+| API key | Secret, backend only |
+| Tokens / context window | Billing and payload size limits |
+| `messages` list | Full request body, resent every call because the service keeps no state |
+| Tool call | `terraform plan`; your code is the `apply` |
+| Agent loop | Reconcile loop with a retry cap |
+| MCP server / client | Microservice and its client; tool schema is the OpenAPI spec |
+| `agno.db` | External session store behind stateless workers |
+| AgentOS | API gateway/runtime in front of the agents |
+| Traces | Observability (spans per model and tool call) |
+| Read-only tools | Least-privilege IAM |
+
+### What to understand most
+
+1. The loop and its failure modes (runaway loops, wrong tool arguments, growing context).
+2. The tool boundary and permissions (read-only vs write, scoped credentials, tool output as untrusted input).
+3. Deployment topology: which processes exist, which ports, which talks to which, and what each failure looks like.
+4. Observability and cost: latency per model call, tokens per request, tool call counts.
+
+### Self-check questions
+
+- What happens if the MCP server is down at startup? Mid-request?
+- How would you stop an agent from deleting production data?
+- Where does the API key live and who can read it?
+- Why did this question take 60 seconds and how would you find out where the time went?
+- What would you monitor in production?
+
+---
+
+## 11. Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `fastapi` command fails or uses `C:\Python313\Scripts` | venv not active, global Python used | `.\venv\Scripts\Activate.ps1`; or `python -m uvicorn main:app --port 8000` |
+| `No module named 'openai'` (or any package) | Installed outside the venv | Activate venv, `pip install` again |
+| `column user.email does not exist` | Model has a column the table lacks | Add an Alembic migration, `alembic upgrade head` |
+| Alembic `DuplicateColumn` | Two migrations add the same column | Keep one; verify with `findstr /n "email" migration\versions\*.py` |
+| Alembic `Target database is not up to date` | Version table out of sync with files | `alembic current`, `alembic heads`, `alembic history --verbose`; only `stamp` once you confirm the revision matches the real schema |
+| `Failed to connect to <MCPTools ...> All connection attempts failed` | MCP server not running on 9000 | Start `python .\mcp_server.py` first |
+| `Errno 10048` bind error on 8000 | Old server still holds the port | `netstat -ano \| findstr :8000`, check with `tasklist /FI "PID eq <pid>"`, `taskkill /PID <pid> /F` |
+| Endless "WatchFiles detected changes ... venv ... Reloading" | Reloader watches `venv\`; OneDrive or `pip install` touches files | Run without `--reload`; pause OneDrive sync; best: move project out of OneDrive |
+| `'OpenAI' object has no attribute 'messages'` | Client swapped but the loop still uses the Anthropic format | Use the full `agent_loop.py` above (`client.chat.completions.create`) |
+| `Not Acceptable: Client must accept text/event-stream` at `/mcp` in a browser | Browsers do not send MCP headers | Expected; use the MCP Inspector |
+| Warning: multiple databases share the same id | Each agent created its own `SqliteDb` on the same file | Create one `db = SqliteDb(...)` and share it |
+| Very slow answers | CPU-only 8B model; agent sends large prompts; first call loads the model | `ollama ps`; keep model loaded; try a 3B model; lower `num_history_runs` |
+| Model answers without calling tools or invents data | Small model weakness | Try another tool-capable model, sharpen tool descriptions, lower temperature |
+
+---
+
+## 12. Security notes
+
+- The AgentOS routes have **no authentication** here, including delete endpoints for sessions, memories and knowledge, and filesystem routes. Keep the server bound to `127.0.0.1` (the default for the commands above).
+- The `if __name__ == "__main__"` block in `main.py` binds `0.0.0.0` (all interfaces). Change it to `127.0.0.1` while this is a local project.
+- Tools are read-only on purpose. Do not give an agent write or delete tools until you understand how it selects them.
+- Treat tool output as untrusted input (prompt injection through the data path).
+- Queries to a remote MCP server (Microsoft Learn) leave the machine. Do not include internal or customer data in them.
+- Keep secrets in the backend `.env`. Add `.env`, `agno.db`, `venv/` and `__pycache__/` to `.gitignore`.
+
+---
+
+## 13. Known limitations
+
+- Local, dummy data, single user, no authentication.
+- Two read-only tools over one table; no multi-step planning, no evaluation, no tests.
+- CPU-bound local model: slow, and small models are unreliable at arithmetic and tool arguments. Verify answers.
+- The React frontend is not yet connected to the agent.
+- Nothing is containerized.
+- The project sits in a OneDrive-synced folder, which interferes with the venv and auto-reload.

@@ -33,6 +33,7 @@ export default function Users() {
                 <th>Age</th>
                 <th>Class</th>
                 <th>Gender</th>
+                <th>Email</th>
               </tr>
             </thead>
             <tbody>
@@ -45,6 +46,7 @@ export default function Users() {
                   <td>{user.age}</td>
                   <td>{user.std}</td>
                   <td>{user.gender}</td>
+                  <td>{user.email || "N/A"}</td>
                 </tr>
               ))}
             </tbody>
